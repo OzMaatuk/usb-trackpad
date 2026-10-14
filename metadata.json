@@ -1,0 +1,7 @@
+{
+  "name": "USB Trackpad",
+  "description": "High-precision zero-latency USB trackpad for Linux host PCs over ADB tunnel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
