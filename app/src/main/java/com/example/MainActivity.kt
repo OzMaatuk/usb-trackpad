@@ -34,6 +34,11 @@ class MainActivity : ComponentActivity(), TrackpadServer.Listener {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Allow local loopback socket traffic without strict mode interference
+        android.os.StrictMode.setThreadPolicy(
+            android.os.StrictMode.ThreadPolicy.Builder().permitAll().build()
+        )
+
         // Keep screen awake permanently while app is active
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 

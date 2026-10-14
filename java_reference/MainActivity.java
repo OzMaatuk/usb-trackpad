@@ -119,7 +119,7 @@ public class MainActivity extends Activity {
         private Socket clientSocket;
         private OutputStream outputStream;
         private final Object sendLock = new Object();
-        private final byte[] packetBuffer = new byte[8];
+        private final java.util.concurrent.ArrayBlockingQueue<Long> packetQueue = new java.util.concurrent.ArrayBlockingQueue<>(512);
 
         public volatile boolean isClientConnected = false;
         public volatile String connectedClientIp = null;
@@ -138,8 +138,17 @@ public class MainActivity extends Activity {
                     runServer();
                 }
             }, "TrackpadServerThread");
-            serverThread.setPriority(Thread.MAX_PRIORITY);
+            serverThread.setPriority(Thread.NORM_PRIORITY);
             serverThread.start();
+
+            Thread senderThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    runSender();
+                }
+            }, "TrackpadSenderThread");
+            senderThread.setPriority(Thread.MAX_PRIORITY);
+            senderThread.start();
         }
 
         public void stop() {
@@ -148,6 +157,7 @@ public class MainActivity extends Activity {
             try {
                 if (serverSocket != null) serverSocket.close();
             } catch (Exception ignored) {}
+            packetQueue.clear();
         }
 
         private void runServer() {
@@ -169,9 +179,9 @@ public class MainActivity extends Activity {
                             outputStream = socket.getOutputStream();
                             isClientConnected = true;
                             connectedClientIp = socket.getInetAddress().getHostAddress();
+                            packetQueue.clear();
                         }
 
-                        // Block until client disconnects
                         byte[] dummy = new byte[64];
                         while (isRunning.get() && socket.isConnected() && !socket.isClosed()) {
                             if (socket.getInputStream().read(dummy) == -1) break;
@@ -188,9 +198,47 @@ public class MainActivity extends Activity {
             }
         }
 
+        private void runSender() {
+            byte[] buffer = new byte[8];
+            while (isRunning.get()) {
+                try {
+                    Long packed = packetQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (packed == null) continue;
+                    OutputStream out;
+                    synchronized (sendLock) {
+                        out = outputStream;
+                    }
+                    if (out != null) {
+                        long p = packed;
+                        buffer[0] = (byte) ((p >>> 56) & 0xFFL);
+                        buffer[1] = (byte) ((p >>> 48) & 0xFFL);
+                        buffer[2] = (byte) ((p >>> 40) & 0xFFL);
+                        buffer[3] = (byte) ((p >>> 32) & 0xFFL);
+                        buffer[4] = (byte) ((p >>> 24) & 0xFFL);
+                        buffer[5] = (byte) ((p >>> 16) & 0xFFL);
+                        buffer[6] = (byte) ((p >>> 8) & 0xFFL);
+                        buffer[7] = (byte) (p & 0xFFL);
+
+                        out.write(buffer, 0, 8);
+                        if (packetQueue.isEmpty()) {
+                            out.flush();
+                        }
+                        packetsSentTotal++;
+                    }
+                } catch (InterruptedException ignored) {
+                    break;
+                } catch (IOException e) {
+                    synchronized (sendLock) {
+                        closeClient();
+                    }
+                }
+            }
+        }
+
         private void closeClient() {
             isClientConnected = false;
             connectedClientIp = null;
+            packetQueue.clear();
             try {
                 if (outputStream != null) outputStream.close();
             } catch (Exception ignored) {}
@@ -203,27 +251,18 @@ public class MainActivity extends Activity {
         }
 
         public boolean sendPacket(byte eventType, short code, short val1, short val2) {
-            synchronized (sendLock) {
-                if (outputStream == null) return false;
-                try {
-                    packetBuffer[0] = MAGIC_BYTE;
-                    packetBuffer[1] = eventType;
-                    packetBuffer[2] = (byte) ((code >> 8) & 0xFF);
-                    packetBuffer[3] = (byte) (code & 0xFF);
-                    packetBuffer[4] = (byte) ((val1 >> 8) & 0xFF);
-                    packetBuffer[5] = (byte) (val1 & 0xFF);
-                    packetBuffer[6] = (byte) ((val2 >> 8) & 0xFF);
-                    packetBuffer[7] = (byte) (val2 & 0xFF);
+            if (!isClientConnected) return false;
+            long p = ((long) MAGIC_BYTE & 0xFFL) << 56;
+            p |= ((long) eventType & 0xFFL) << 48;
+            p |= ((long) code & 0xFFFFL) << 32;
+            p |= ((long) val1 & 0xFFFFL) << 16;
+            p |= ((long) val2 & 0xFFFFL);
 
-                    outputStream.write(packetBuffer, 0, 8);
-                    outputStream.flush();
-                    packetsSentTotal++;
-                    return true;
-                } catch (IOException e) {
-                    closeClient();
-                    return false;
-                }
+            if (!packetQueue.offer(p)) {
+                packetQueue.poll();
+                packetQueue.offer(p);
             }
+            return true;
         }
     }
 

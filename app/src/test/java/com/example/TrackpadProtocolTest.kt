@@ -23,6 +23,30 @@ class TrackpadProtocolTest {
     }
 
     @Test
+    fun testPacketBitPacking() {
+        val magic: Byte = 0xAA.toByte()
+        val evType: Byte = 0x01.toByte()
+        val code: Short = 0
+        val dx: Short = -42
+        val dy: Short = 105
+
+        val packed = TrackpadServer.packPacket(magic, evType, code, dx, dy)
+        val dest = ByteArray(8)
+        TrackpadServer.unpackPacket(packed, dest)
+
+        assertEquals(magic, dest[0])
+        assertEquals(evType, dest[1])
+        assertEquals(0.toByte(), dest[2])
+        assertEquals(0.toByte(), dest[3])
+
+        val unpackedDx = ((dest[4].toInt() shl 8) or (dest[5].toInt() and 0xFF)).toShort()
+        val unpackedDy = ((dest[6].toInt() shl 8) or (dest[7].toInt() and 0xFF)).toShort()
+
+        assertEquals(dx, unpackedDx)
+        assertEquals(dy, unpackedDy)
+    }
+
+    @Test
     fun testServerClientTransmission() {
         val testPort = 18081
         val server = TrackpadServer(port = testPort)
