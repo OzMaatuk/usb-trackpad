@@ -1,0 +1,6 @@
+{
+  "summary":  "Architectural and UX implementation plan for adding a toggleable 3-mode Ortholinear Workstation Keyboard (Trackpad-only, Split-view, Full-keyboard) with Linux uinput scancodes, hybrid chording/sticky modifiers, media/language/power keys, and a comprehensive README overhaul.",
+  "updatedAt":  "2026-10-29T09:49:47.454203181Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

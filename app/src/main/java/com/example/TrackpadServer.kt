@@ -41,6 +41,7 @@ class TrackpadServer(
         const val EVENT_MOVE: Byte = 0x01
         const val EVENT_BUTTON: Byte = 0x02
         const val EVENT_SCROLL: Byte = 0x03
+        const val EVENT_KEY: Byte = 0x04
 
         const val BTN_LEFT: Short = 1
         const val BTN_RIGHT: Short = 2
@@ -276,6 +277,9 @@ class TrackpadServer(
 
     fun sendScroll(vScroll: Short, hScroll: Short): Boolean =
         sendPacket(EVENT_SCROLL, 0, vScroll, hScroll)
+
+    fun sendKey(keyCode: Short, state: Short, modMask: Short = 0): Boolean =
+        sendPacket(EVENT_KEY, keyCode, state, modMask)
 
     fun sendPing(): Boolean =
         sendPacket(EVENT_PING, 0, 0, 0)

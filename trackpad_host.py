@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Zero-Latency USB Trackpad Host Daemon for Linux
-Translates binary packets from an Android tablet over an ADB tunnel into native
-kernel input events via python-evdev /dev/uinput.
+Zero-Latency USB Trackpad & Ortholinear Pro Keyboard Host Daemon for Linux
+Translates compact 8-byte binary packets from an Android tablet over an ADB USB
+tunnel into native kernel input events via python-evdev (/dev/uinput).
 
-Compatible with X11, Wayland, GNOME, KDE, Sway, Hyprland, and raw Linux consoles.
+Registers two dedicated kernel virtual devices:
+  1. "Android Low-Latency USB Trackpad" (EV_REL pointer + mouse buttons)
+  2. "Android Low-Latency Pro Keyboard" (Full ANSI/ISO scancodes, F1-F12, Media, Sleep/Power)
+
+Compatible with X11, Wayland, GNOME, KDE Plasma, Sway, Hyprland, and Linux TTYs.
 """
 
-import os
 import sys
 import time
 import socket
@@ -16,7 +19,6 @@ import subprocess
 import argparse
 
 try:
-    import evdev
     from evdev import UInput, ecodes
 except ImportError:
     print("\n[!] Error: 'python-evdev' is not installed.")
@@ -27,33 +29,70 @@ except ImportError:
     print("      Or with pip:   pip3 install evdev\n")
     sys.exit(1)
 
-# Protocol Constants
+# 8-Byte Frame Protocol Constants
 MAGIC_BYTE = 0xAA
+EVENT_PING = 0x00
 EVENT_MOVE = 0x01
 EVENT_BUTTON = 0x02
 EVENT_SCROLL = 0x03
-EVENT_PING = 0x00
+EVENT_KEY = 0x04
 
-# Button Codes
+# Mouse Button IDs
 BTN_CODE_LEFT = 1
 BTN_CODE_RIGHT = 2
 BTN_CODE_MIDDLE = 3
 
-# Button States
+# Key / Button States
 STATE_RELEASE = 0
 STATE_PRESS = 1
 STATE_CLICK = 2
 
+# Atomic Modifier Bitmask (in val2 of EVENT_KEY)
+MOD_CTRL = 0x01
+MOD_SHIFT = 0x02
+MOD_ALT = 0x04
+MOD_SUPER = 0x08
+
+MODIFIER_MAP = (
+    (MOD_CTRL, ecodes.KEY_LEFTCTRL),
+    (MOD_SHIFT, ecodes.KEY_LEFTSHIFT),
+    (MOD_ALT, ecodes.KEY_LEFTALT),
+    (MOD_SUPER, ecodes.KEY_LEFTMETA),
+)
+
 PACKET_STRUCT = struct.Struct("!BBhhh")
 PACKET_SIZE = PACKET_STRUCT.size  # 8 bytes
+
+# Supported Keyboard, Function, Navigation, Media & ACPI Power Keycodes
+KEYBOARD_CAP_KEYS = sorted(
+    set(range(ecodes.KEY_ESC, ecodes.KEY_DELETE + 1))
+    | {
+        ecodes.KEY_MUTE,
+        ecodes.KEY_VOLUMEDOWN,
+        ecodes.KEY_VOLUMEUP,
+        ecodes.KEY_POWER,
+        ecodes.KEY_LEFTMETA,
+        ecodes.KEY_RIGHTMETA,
+        ecodes.KEY_COMPOSE,
+        ecodes.KEY_SLEEP,
+        ecodes.KEY_WAKEUP,
+        ecodes.KEY_NEXTSONG,
+        ecodes.KEY_PLAYPAUSE,
+        ecodes.KEY_PREVIOUSSONG,
+        ecodes.KEY_STOPCD,
+    }
+)
+VALID_KEY_SET = set(KEYBOARD_CAP_KEYS)
 
 
 def setup_adb_forward(port: int) -> bool:
     """Configures adb port forwarding to tunnel TCP over USB."""
     try:
-        res = subprocess.run(["adb", "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run(
+            ["adb", "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
         if res.returncode != 0:
-            print("[!] Warning: 'adb' returned an error. Ensure android-tools is installed.")
+            print("[!] Warning: 'adb' returned an error. Ensure android-tools-adb is installed.")
             return False
 
         cmd = ["adb", "forward", f"tcp:{port}", f"tcp:{port}"]
@@ -65,13 +104,13 @@ def setup_adb_forward(port: int) -> bool:
             print(f"[!] Warning: 'adb forward' failed: {res.stderr.strip()}")
             return False
     except FileNotFoundError:
-        print("[!] Warning: 'adb' not found in PATH. Please ensure ADB is installed and port 8081 is forwarded.")
+        print("[!] Warning: 'adb' not found in PATH. Ensure ADB is installed and port 8081 is forwarded.")
         return False
 
 
-def create_uinput_device() -> UInput:
-    """Creates a virtual mouse/trackpad device in the Linux kernel via /dev/uinput."""
-    capabilities = {
+def create_uinput_devices() -> tuple[UInput, UInput]:
+    """Creates dedicated virtual Mouse and Pro Keyboard kernel devices via /dev/uinput."""
+    mouse_caps = {
         ecodes.EV_REL: [
             ecodes.REL_X,
             ecodes.REL_Y,
@@ -85,30 +124,44 @@ def create_uinput_device() -> UInput:
         ],
     }
 
+    kbd_caps = {
+        ecodes.EV_KEY: KEYBOARD_CAP_KEYS,
+    }
+
     try:
-        device = UInput(
-            events=capabilities,
+        mouse_dev = UInput(
+            events=mouse_caps,
             name="Android Low-Latency USB Trackpad",
-            vendor=0x18D1,   # Google / Android
-            product=0x4EE7,  # Virtual Peripheral
-            version=0x0100,
+            vendor=0x18D1,
+            product=0x4EE7,
+            version=0x0200,
         )
-        print(f"[+] Created virtual input device: {device.name} ({device.device.path})")
-        return device
+        kbd_dev = UInput(
+            events=kbd_caps,
+            name="Android Low-Latency Pro Keyboard",
+            vendor=0x18D1,
+            product=0x4EE8,
+            version=0x0200,
+        )
+        print(f"[+] Virtual Mouse:    {mouse_dev.name} ({mouse_dev.device.path})")
+        print(f"[+] Virtual Keyboard: {kbd_dev.name} ({kbd_dev.device.path})")
+        return mouse_dev, kbd_dev
     except PermissionError:
         print("\n[!] Permission Denied opening /dev/uinput.")
         print("    To run without root/sudo:")
         print("    1. Add your user to the 'input' group:")
         print("       sudo usermod -aG input $USER")
         print("    2. Add udev rule for uinput:")
-        print('       echo \'KERNEL=="uinput", GROUP="input", MODE="0660"\' | sudo tee /etc/udev/rules.d/99-uinput.rules')
+        print(
+            '       echo \'KERNEL=="uinput", GROUP="input", MODE="0660"\' '
+            "| sudo tee /etc/udev/rules.d/99-uinput.rules"
+        )
         print("       sudo udevadm control --reload-rules && sudo udevadm trigger")
         print("    3. Log out and log back in, or run with 'sudo python3 trackpad_host.py'.\n")
         sys.exit(1)
 
 
 def map_button_code(code: int) -> int:
-    """Maps custom protocol button ID to Linux evdev button code."""
     if code == BTN_CODE_LEFT:
         return ecodes.BTN_LEFT
     elif code == BTN_CODE_RIGHT:
@@ -118,31 +171,99 @@ def map_button_code(code: int) -> int:
     return ecodes.BTN_LEFT
 
 
-def run_daemon(host: str, port: int, speed_multiplier: float):
-    """Main daemon loop: connects to Android tablet and injects input events."""
-    print("==================================================")
-    print("   Android USB Trackpad Host Daemon (Linux)      ")
-    print("==================================================")
-    print(f"Target: {host}:{port} | Multiplier: {speed_multiplier:.2f}x\n")
+def handle_key_event(
+    kbd_dev: UInput,
+    held_keys: set[int],
+    keycode: int,
+    state: int,
+    mod_mask: int,
+    direct_power: bool,
+) -> None:
+    """Injects keyboard, media, or power scancodes with optional atomic modifier chords."""
+    if direct_power and state in (STATE_PRESS, STATE_CLICK):
+        if keycode == ecodes.KEY_SLEEP:
+            subprocess.Popen(["systemctl", "suspend"])
+            return
+        elif keycode == ecodes.KEY_POWER:
+            subprocess.Popen(["systemctl", "poweroff", "-i"])
+            return
+
+    if keycode not in VALID_KEY_SET:
+        return
+
+    if state == STATE_PRESS:
+        kbd_dev.write(ecodes.EV_KEY, keycode, 1)
+        kbd_dev.syn()
+        held_keys.add(keycode)
+
+    elif state == STATE_RELEASE:
+        kbd_dev.write(ecodes.EV_KEY, keycode, 0)
+        kbd_dev.syn()
+        held_keys.discard(keycode)
+
+    elif state == STATE_CLICK:
+        # Press any transient sticky/macro modifiers not already physically held
+        transient_mods = []
+        if mod_mask != 0:
+            for bit, mod_code in MODIFIER_MAP:
+                if (mod_mask & bit) and (mod_code not in held_keys):
+                    kbd_dev.write(ecodes.EV_KEY, mod_code, 1)
+                    transient_mods.append(mod_code)
+            if transient_mods:
+                kbd_dev.syn()
+
+        # Distinct EV_SYN frames give zero-blocking sub-50us key tap across X11 & Wayland
+        kbd_dev.write(ecodes.EV_KEY, keycode, 1)
+        kbd_dev.syn()
+        kbd_dev.write(ecodes.EV_KEY, keycode, 0)
+        kbd_dev.syn()
+
+        if transient_mods:
+            for mod_code in reversed(transient_mods):
+                kbd_dev.write(ecodes.EV_KEY, mod_code, 0)
+            kbd_dev.syn()
+
+
+def release_all_held(mouse_dev: UInput, kbd_dev: UInput, held_buttons: set[int], held_keys: set[int]) -> None:
+    """Safety watchdog: releases any held mouse buttons or keyboard modifiers on disconnect."""
+    if held_buttons:
+        for btn in list(held_buttons):
+            mouse_dev.write(ecodes.EV_KEY, btn, 0)
+        mouse_dev.syn()
+        held_buttons.clear()
+
+    if held_keys:
+        for key in list(held_keys):
+            kbd_dev.write(ecodes.EV_KEY, key, 0)
+        kbd_dev.syn()
+        held_keys.clear()
+
+
+def run_daemon(host: str, port: int, speed_multiplier: float, direct_power: bool):
+    print("==========================================================")
+    print("  Android USB Workstation Daemon (Trackpad + Keyboard)    ")
+    print("==========================================================")
+    print(f"Target: {host}:{port} | Speed: {speed_multiplier:.2f}x | DirectPower: {direct_power}\n")
 
     setup_adb_forward(port)
-    uinput_dev = create_uinput_device()
+    mouse_dev, kbd_dev = create_uinput_devices()
+
+    held_buttons: set[int] = set()
+    held_keys: set[int] = set()
 
     while True:
         sock = None
         try:
-            print(f"[i] Connecting to trackpad server at {host}:{port}...")
+            print(f"[i] Connecting to tablet workstation server at {host}:{port}...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(5.0)
 
             sock.connect((host, port))
             sock.settimeout(None)
-            print(f"[✓] Connected successfully! Trackpad active. Touch tablet to move cursor.")
+            print("[✓] Connected! Trackpad & Ortholinear Pro Keyboard active.")
 
             raw_buffer = bytearray()
-            packet_count = 0
-            last_stat_time = time.time()
 
             while True:
                 chunk = sock.recv(4096)
@@ -166,48 +287,44 @@ def run_daemon(host: str, port: int, speed_multiplier: float):
                     packet_bytes = raw_buffer[:PACKET_SIZE]
                     del raw_buffer[:PACKET_SIZE]
 
-                    magic, ev_type, code, val1, val2 = PACKET_STRUCT.unpack(packet_bytes)
-                    packet_count += 1
+                    _, ev_type, code, val1, val2 = PACKET_STRUCT.unpack(packet_bytes)
 
                     if ev_type == EVENT_MOVE:
                         dx = int(val1 * speed_multiplier)
                         dy = int(val2 * speed_multiplier)
                         if dx != 0 or dy != 0:
-                            uinput_dev.write(ecodes.EV_REL, ecodes.REL_X, dx)
-                            uinput_dev.write(ecodes.EV_REL, ecodes.REL_Y, dy)
-                            uinput_dev.syn()
+                            mouse_dev.write(ecodes.EV_REL, ecodes.REL_X, dx)
+                            mouse_dev.write(ecodes.EV_REL, ecodes.REL_Y, dy)
+                            mouse_dev.syn()
 
                     elif ev_type == EVENT_BUTTON:
                         btn = map_button_code(code)
                         if val1 == STATE_PRESS:
-                            uinput_dev.write(ecodes.EV_KEY, btn, 1)
-                            uinput_dev.syn()
+                            mouse_dev.write(ecodes.EV_KEY, btn, 1)
+                            mouse_dev.syn()
+                            held_buttons.add(btn)
                         elif val1 == STATE_RELEASE:
-                            uinput_dev.write(ecodes.EV_KEY, btn, 0)
-                            uinput_dev.syn()
+                            mouse_dev.write(ecodes.EV_KEY, btn, 0)
+                            mouse_dev.syn()
+                            held_buttons.discard(btn)
                         elif val1 == STATE_CLICK:
-                            uinput_dev.write(ecodes.EV_KEY, btn, 1)
-                            uinput_dev.syn()
-                            time.sleep(0.015)
-                            uinput_dev.write(ecodes.EV_KEY, btn, 0)
-                            uinput_dev.syn()
+                            mouse_dev.write(ecodes.EV_KEY, btn, 1)
+                            mouse_dev.syn()
+                            mouse_dev.write(ecodes.EV_KEY, btn, 0)
+                            mouse_dev.syn()
 
                     elif ev_type == EVENT_SCROLL:
-                        v_scroll = val1
-                        h_scroll = val2
-                        if v_scroll != 0:
-                            uinput_dev.write(ecodes.EV_REL, ecodes.REL_WHEEL, v_scroll)
-                        if h_scroll != 0:
-                            uinput_dev.write(ecodes.EV_REL, ecodes.REL_HWHEEL, h_scroll)
-                        uinput_dev.syn()
+                        if val1 != 0:
+                            mouse_dev.write(ecodes.EV_REL, ecodes.REL_WHEEL, val1)
+                        if val2 != 0:
+                            mouse_dev.write(ecodes.EV_REL, ecodes.REL_HWHEEL, val2)
+                        mouse_dev.syn()
+
+                    elif ev_type == EVENT_KEY:
+                        handle_key_event(kbd_dev, held_keys, code, val1, val2, direct_power)
 
                     elif ev_type == EVENT_PING:
                         pass
-
-                now = time.time()
-                if now - last_stat_time >= 10.0:
-                    packet_count = 0
-                    last_stat_time = now
 
         except (socket.error, ConnectionRefusedError, socket.timeout):
             sys.stdout.write(f"\r[!] Waiting for tablet app on {host}:{port}... (Retrying in 2s)")
@@ -222,24 +339,38 @@ def run_daemon(host: str, port: int, speed_multiplier: float):
             print(f"\n[!] Unexpected error: {e}")
             time.sleep(2.0)
         finally:
+            release_all_held(mouse_dev, kbd_dev, held_buttons, held_keys)
             if sock:
                 try:
                     sock.close()
                 except Exception:
                     pass
 
-    uinput_dev.close()
-    print("[+] Virtual input device closed. Goodbye.")
+    mouse_dev.close()
+    kbd_dev.close()
+    print("[+] Virtual input devices closed. Goodbye.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Zero-latency USB Trackpad daemon for Linux host")
-    parser.add_argument("--host", default="127.0.0.1", help="Target host (default: 127.0.0.1 via ADB forward)")
+    parser = argparse.ArgumentParser(
+        description="Zero-latency USB Trackpad & Pro Keyboard daemon for Linux host"
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Target host (default: 127.0.0.1 via ADB forward)"
+    )
     parser.add_argument("--port", type=int, default=8081, help="Target TCP port (default: 8081)")
-    parser.add_argument("--multiplier", type=float, default=1.0, help="Cursor speed multiplier (default: 1.0)")
+    parser.add_argument(
+        "--multiplier", type=float, default=1.0, help="Host-side cursor speed multiplier (default: 1.0)"
+    )
+    parser.add_argument(
+        "--direct-power",
+        action="store_true",
+        help="Execute 'systemctl suspend' / 'systemctl poweroff -i' directly on Sleep/Off keys "
+        "(useful on closed-lid laptops where desktop environments ignore KEY_SLEEP)",
+    )
     args = parser.parse_args()
 
-    run_daemon(args.host, args.port, args.multiplier)
+    run_daemon(args.host, args.port, args.multiplier, args.direct_power)
 
 
 if __name__ == "__main__":

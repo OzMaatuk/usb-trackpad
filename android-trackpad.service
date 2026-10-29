@@ -1,0 +1,17 @@
+[Unit]
+Description=Android USB Trackpad Host Daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+# Path to python3 and trackpad_host.py (configured by install_service.sh)
+ExecStart=/usr/bin/python3 %h/.local/bin/trackpad_host.py
+Restart=always
+RestartSec=3
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
